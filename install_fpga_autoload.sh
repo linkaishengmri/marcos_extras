@@ -250,6 +250,7 @@ deploy_from_host()
     board_host=$1
     remote=root@$board_host
     remote_script=/tmp/install_fpga_autoload.sh
+    upload_script=
 
     valid_board_host "$board_host" || fail "Invalid board address: $board_host"
     command -v ssh >/dev/null 2>&1 || fail "ssh is not available"
@@ -259,21 +260,35 @@ deploy_from_host()
         fail "Unable to locate this script"
     local_script=$script_dir/$(basename "$0")
 
+    upload_script=$(mktemp "${TMPDIR:-/tmp}/install_fpga_autoload.XXXXXX") || \
+        fail "Unable to create a temporary upload file"
+    trap 'if [ -n "$upload_script" ]; then rm -f "$upload_script"; fi' 0 1 2 15
+
+    tr -d '\015' < "$local_script" > "$upload_script" || \
+        fail "Unable to normalize the installer line endings"
+    [ -s "$upload_script" ] || fail "The normalized installer is empty"
+
     say "Checking SSH access to $remote"
     ssh -o ConnectTimeout=10 "$remote" true || fail "Unable to connect to $remote"
 
-    say "Uploading the installer"
-    if ! scp -o ConnectTimeout=10 "$local_script" "$remote:$remote_script"; then
+    say "Uploading the LF-normalized installer"
+    if ! scp -o ConnectTimeout=10 "$upload_script" "$remote:$remote_script"; then
         say "Retrying with the legacy SCP protocol"
-        scp -O -o ConnectTimeout=10 "$local_script" "$remote:$remote_script" || \
+        scp -O -o ConnectTimeout=10 "$upload_script" "$remote:$remote_script" || \
             fail "Unable to upload the installer"
     fi
+
+    say "Checking the uploaded shell syntax"
+    ssh -o ConnectTimeout=10 "$remote" "/bin/sh -n $remote_script" || \
+        fail "The uploaded installer failed the board shell syntax check"
 
     say "Installing the early boot service"
     ssh -o ConnectTimeout=10 "$remote" "/bin/sh $remote_script --board-install" || \
         fail "Remote installation failed"
 
     ssh -o ConnectTimeout=10 "$remote" "rm -f $remote_script" >/dev/null 2>&1 || true
+    rm -f "$upload_script"
+    upload_script=
     say "Remote installation completed"
 }
 
