@@ -1,15 +1,17 @@
 #!/bin/sh
 #
-# Install the MaRCoS FPGA loader as an early SysV boot service.
+# Enable or disable the MaRCoS FPGA loader as an early SysV boot service.
 #
 # Host usage:
 #   sh ./install_fpga_autoload.sh BOARD_IP
+#   sh ./install_fpga_autoload.sh BOARD_IP --disable
 #
 # Windows PowerShell must launch this script through the same Git Bash
 # executable used by MaSeqMimo. See readme.org for an example.
 #
 # Direct board usage:
 #   /bin/sh install_fpga_autoload.sh --board-install
+#   /bin/sh install_fpga_autoload.sh --board-disable
 #
 # The bitstream and overlay must already have been installed by
 # copy_bitstream.sh as:
@@ -43,14 +45,18 @@ usage()
     cat <<EOF
 Usage:
   $PROGRAM_NAME BOARD_IP
+  $PROGRAM_NAME BOARD_IP --disable
   $PROGRAM_NAME --board-install
+  $PROGRAM_NAME --board-disable
   $PROGRAM_NAME {start|stop|restart|status}
 
 Run the BOARD_IP form from the marcos_extras directory on the host.
 It uploads this script and installs the early SysV boot service remotely.
 Windows PowerShell users must launch this script through Git Bash.
 
-Use --board-install only when this script has already been copied to the board.
+Use --board-install or --board-disable after copying this script to the board.
+Disabling removes boot start links only. It preserves the running FPGA,
+firmware files and init script. Omit --disable to enable autoload again.
 EOF
 }
 
@@ -185,6 +191,41 @@ remove_late_start_links()
     done
 }
 
+disable_on_board()
+{
+    [ "$(id -u)" -eq 0 ] || fail "Disabling autoload must run as root"
+    [ -d /etc/init.d ] || fail "SysV init directory not found: /etc/init.d"
+
+    # Validate all candidates before removing any links. Include early rcS
+    # links, old late runlevel links, and links whose init script is missing.
+    for phase in validate remove; do
+        for runlevel_dir in \
+            /etc/rcS.d /etc/rc0.d /etc/rc1.d /etc/rc2.d /etc/rc3.d \
+            /etc/rc4.d /etc/rc5.d /etc/rc6.d
+        do
+            [ -d "$runlevel_dir" ] || continue
+            for link in "$runlevel_dir"/S[0-9][0-9]marcos-fpga; do
+                [ -e "$link" ] || [ -L "$link" ] || continue
+                [ -L "$link" ] || fail "Unexpected boot entry; left untouched: $link"
+                target=$(readlink "$link") || fail "Unable to read link: $link"
+                case "$target" in
+                    ../init.d/marcos-fpga|/etc/init.d/marcos-fpga) ;;
+                    *) fail "Unexpected link target; left untouched: $link -> $target" ;;
+                esac
+                if [ "$phase" = remove ]; then
+                    say "Removing autoload start link: $link"
+                    rm "$link" || fail "Unable to remove $link"
+                fi
+            done
+        done
+    done
+
+    sync || fail "Unable to flush filesystem changes"
+    say "MaRCoS FPGA autoload is disabled"
+    say "This service will not load the FPGA on the next boot"
+    say "The running FPGA, firmware files and init script were preserved"
+}
+
 install_on_board()
 {
     [ "$(id -u)" -eq 0 ] || fail "Board installation must run as root"
@@ -248,6 +289,11 @@ valid_board_host()
 deploy_from_host()
 {
     board_host=$1
+    board_action=${2:---board-install}
+    case "$board_action" in
+        --board-install|--board-disable) ;;
+        *) fail "Invalid board action: $board_action" ;;
+    esac
     remote=root@$board_host
     remote_script=/tmp/install_fpga_autoload.sh
     upload_script=
@@ -282,14 +328,18 @@ deploy_from_host()
     ssh -o ConnectTimeout=10 "$remote" "/bin/sh -n $remote_script" || \
         fail "The uploaded installer failed the board shell syntax check"
 
-    say "Installing the early boot service"
-    ssh -o ConnectTimeout=10 "$remote" "/bin/sh $remote_script --board-install" || \
-        fail "Remote installation failed"
+    if [ "$board_action" = --board-disable ]; then
+        say "Disabling FPGA autoload"
+    else
+        say "Installing the early boot service"
+    fi
+    ssh -o ConnectTimeout=10 "$remote" "/bin/sh $remote_script $board_action" || \
+        fail "Remote action failed: $board_action"
 
     ssh -o ConnectTimeout=10 "$remote" "rm -f $remote_script" >/dev/null 2>&1 || true
     rm -f "$upload_script"
     upload_script=
-    say "Remote installation completed"
+    say "Remote action completed: $board_action"
 }
 
 case "${1:-}" in
@@ -307,16 +357,28 @@ case "${1:-}" in
         service_status
         ;;
     --board-install)
+        [ "$#" -eq 1 ] || fail "--board-install takes no additional arguments"
         install_on_board
+        ;;
+    --board-disable)
+        [ "$#" -eq 1 ] || fail "--board-disable takes no additional arguments"
+        disable_on_board
         ;;
     -h|--help|"")
         usage
         ;;
+    -*)
+        usage >&2
+        exit 2
+        ;;
     *)
-        [ "$#" -eq 1 ] || {
+        if [ "$#" -eq 1 ]; then
+            deploy_from_host "$1" --board-install
+        elif [ "$#" -eq 2 ] && [ "$2" = --disable ]; then
+            deploy_from_host "$1" --board-disable
+        else
             usage >&2
             exit 2
-        }
-        deploy_from_host "$1"
+        fi
         ;;
 esac
